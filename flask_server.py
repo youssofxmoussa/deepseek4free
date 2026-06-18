@@ -27,6 +27,9 @@ def get_api():
 def _strip_search(text: str) -> str:
     return re.sub(r'SEARCHING.*?(?:SEARCHINGFINISHED|FINISHED)', '', text, flags=re.DOTALL).strip()
 
+def _sse(obj: dict) -> str:
+    return f"data: {json.dumps(obj)}\n\n"
+
 
 @app.route("/deepseek/api/health", methods=["GET"])
 def health():
@@ -54,6 +57,9 @@ def chat():
         # ── Streaming mode ──────────────────────────────────────────────
         if stream:
             def generate():
+                # Send an immediate ping so the proxy doesn't buffer waiting for data
+                yield ": ping\n\n"
+
                 try:
                     for chunk in api.chat_completion(
                         session_id, message,
@@ -65,36 +71,36 @@ def chat():
                         c = chunk.get("content", "")
 
                         if t == "thinking" and c:
-                            yield f"data: {json.dumps({'type': 'thinking', 'content': c})}\n\n"
+                            yield _sse({"type": "thinking", "content": c})
 
                         elif t == "text" and c:
                             clean = _strip_search(c)
                             if clean:
-                                yield f"data: {json.dumps({'type': 'text', 'content': clean})}\n\n"
+                                yield _sse({"type": "text", "content": clean})
 
                         elif t == "done":
                             mid = chunk.get("message_id")
-                            yield f"data: {json.dumps({'type': 'done', 'session_id': session_id, 'message_id': mid})}\n\n"
+                            yield _sse({"type": "done", "session_id": session_id, "message_id": mid})
 
                     yield "data: [DONE]\n\n"
 
                 except AuthenticationError as e:
-                    yield f"data: {json.dumps({'type': 'error', 'code': 401, 'error': str(e)})}\n\n"
+                    yield _sse({"type": "error", "code": 401, "error": str(e)})
                 except RateLimitError:
-                    yield f"data: {json.dumps({'type': 'error', 'code': 429, 'error': 'Rate limit exceeded'})}\n\n"
+                    yield _sse({"type": "error", "code": 429, "error": "Rate limit exceeded"})
                 except NetworkError as e:
-                    yield f"data: {json.dumps({'type': 'error', 'code': 503, 'error': str(e)})}\n\n"
+                    yield _sse({"type": "error", "code": 503, "error": str(e)})
                 except Exception as e:
                     app.logger.exception("Stream error")
-                    yield f"data: {json.dumps({'type': 'error', 'code': 500, 'error': str(e)})}\n\n"
+                    yield _sse({"type": "error", "code": 500, "error": str(e)})
 
             return Response(
                 stream_with_context(generate()),
-                content_type="text/event-stream",
+                mimetype="text/event-stream",
                 headers={
-                    "Cache-Control":    "no-cache",
-                    "X-Accel-Buffering":"no",
-                    "Connection":       "keep-alive",
+                    "Cache-Control":     "no-cache, no-transform",
+                    "X-Accel-Buffering": "no",
+                    "Connection":        "keep-alive",
                 },
             )
 
@@ -118,8 +124,8 @@ def chat():
             elif t == "done":
                 message_id = chunk.get("message_id")
 
-        response_text  = _strip_search("".join(text_parts))
-        thinking_text  = "".join(thinking_parts)
+        response_text = _strip_search("".join(text_parts))
+        thinking_text = "".join(thinking_parts)
 
         return jsonify({
             "response":     response_text,
@@ -144,4 +150,5 @@ def chat():
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5001))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    # threaded=True is required for SSE streaming to work with Flask's dev server
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
